@@ -8,9 +8,11 @@
 import argparse
 import time
 import warnings
-
+import os
+#os.environ["CUDA_VISIBLE_DEVICES"]= ""
 # tools
 import torch
+from torch import nn
 from torch.autograd import Variable
 import matplotlib.pyplot as plt
 import numpy as np 
@@ -86,31 +88,61 @@ def main(args):
     fileName = args.output_flux_file
     balanceName = args.output_balance_file
     EPOCH = args.train_epoch
+    normalization = args.normalization
+    dev = args.device
     
     if EPOCH <= 0:
         raise NameError('EPOCH must greater than 1!')
 
+
+    if (dev=='auto' or dev=='gpu'):
     # choose cpu or gpu automatically
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            print("\nCUDA is available. Training on GPU.")
+            num_gpus = torch.cuda.device_count()
+            print(f"Number of GPUs available: {num_gpus}")
+            device = "cuda"
+        else:
+            print("\nCUDA is not available. Training on CPU.")
+            device = "cpu"
+    else:
+        print("\nTraining on CPU.")
+        device = "cpu"
+    
     
     # read data
-    print("Starting load data...")
+    print("\nStarting load data...")
     geneExpr = pd.read_csv(
                 input_path + '/' + test_file,
                 index_col=0)
     geneExpr = geneExpr.T
     geneExpr = geneExpr * 1.0
+    
+    # imputation
     if sc_imputation == True:
+        print("Performing Imputation...")
         magic_operator = magic.MAGIC()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             geneExpr = magic_operator.fit_transform(geneExpr)
+    else:
+        print("No Imputation!")
+            
     if geneExpr.max().max() > 50:
+        print("Performing log transformation")
         geneExpr = (geneExpr + 1).apply(np.log2)  
-    geneExprSum = geneExpr.sum(axis=1)
-    stand = geneExprSum.mean()
-    geneExprScale = geneExprSum / stand
-    geneExprScale = torch.FloatTensor(geneExprScale.values).to(device)
+        
+    
+    # normalization
+    if normalization:    
+        print("Performing Normalization...")
+        geneExprSum = geneExpr.sum(axis=1)
+        stand = geneExprSum.mean()
+        geneExprScale = geneExprSum / stand
+        geneExprScale = torch.FloatTensor(geneExprScale.values).to(device)
+    else:
+        print("No Normalization!")
+        geneExprScale = torch.FloatTensor(np.ones(geneExpr.shape[0])).to(device)
     
     BATCH_SIZE = geneExpr.shape[0]
     
@@ -148,7 +180,7 @@ def main(args):
         cName = cName.columns
     print("Load data done.")
     
-    print("Starting process data...")
+    print("\nStarting process data...")
     emptyNode = []
     # extract overlap gene
     geneExpr = geneExpr[gene_overlap] 
@@ -169,7 +201,7 @@ def main(args):
         temp.loc[:, [g for g in gene_names if g not in genes]] = 0
         temp = temp.T
         temp['Module_Gene'] = ['%02d_%s' % (i,g) for g in gene_names]
-        geneExprDf = geneExprDf.append(temp, ignore_index = True, sort=False)
+        geneExprDf = pd.concat([geneExprDf,temp], ignore_index = True, sort=False)
     geneExprDf.index = geneExprDf['Module_Gene']
     geneExprDf.drop('Module_Gene', axis = 'columns', inplace = True)
     X = geneExprDf.values.T
@@ -189,7 +221,15 @@ def main(args):
 # =============================================================================
     #NN
     torch.manual_seed(16)
-    net = FLUX(X, n_modules, f_in = n_genes, f_out = 1).to(device)
+    net = FLUX(X, n_modules, f_in = n_genes, f_out = 1)
+    
+    net.to(device)
+    #if device == "cuda":
+        #if torch.cuda.device_count() > 1:
+            #print(f"\nUsing {torch.cuda.device_count()} GPUs!")
+            #net = nn.DataParallel(net)
+    
+        
     optimizer = torch.optim.Adam(net.parameters(), lr = LEARN_RATE)
 
     #Dataloader
@@ -199,16 +239,11 @@ def main(args):
                          'pin_memory': False}
 
     dataSet = MyDataset(X, geneExprScale, module_scale)
-    train_loader = torch.utils.data.DataLoader(dataset=dataSet,
-                                               **dataloader_params)
+    train_loader = torch.utils.data.DataLoader(dataset=dataSet, **dataloader_params)
+    
     
 # =============================================================================
-
-  
-   
-    
-# =============================================================================
-    print("Starting train neural network...")
+    print("\nStarting train neural network...")
     start = time.time()  
 #   training
     loss_v = []
@@ -244,15 +279,15 @@ def main(args):
             loss3 += loss3_batch.cpu().data.numpy()
             loss4 += loss4_batch.cpu().data.numpy()
             
-        #print('epoch: %02d, loss1: %.8f, loss2: %.8f, loss3: %.8f, loss4: %.8f, loss: %.8f' % (epoch+1, loss1, loss2, loss3, loss4, loss))
-        file_loss.write('epoch: %02d, loss1: %.8f, loss2: %.8f, loss3: %.8f, loss4: %.8f, loss: %.8f. \n' % (epoch+1, loss1, loss2, loss3, loss4, loss))
+        print('   epoch: %02d, loss1_balance: %.8f, loss2_nneg: %.8f, loss3_cellvar: %.8f, loss4_modvar: %.8f, loss: %.8f' % (epoch+1, loss1, loss2, loss3, loss4, loss), end='\r\x1b[1A')
+        file_loss.write('epoch: %02d, loss1_balance: %.8f, loss2_nneg: %.8f, loss3_cellvar: %.8f, loss4_modvar: %.8f, loss: %.8f. \n' % (epoch+1, loss1, loss2, loss3, loss4, loss))
         
         loss_v.append(loss)
         loss_v1.append(loss1)
         loss_v2.append(loss2)
         loss_v3.append(loss3)
         loss_v4.append(loss4)
-        
+    print("")     
 # =============================================================================
     end = time.time()
     print("Training time: ", end - start) 
@@ -296,8 +331,8 @@ def main(args):
             out_m_batch, out_c_batch = net(X_batch, n_modules, n_genes, n_comps, cmMat)
             
             # save data
-            fluxStatuTest[i, :] = out_m_batch.detach().numpy()
-            balanceStatus[i, :] = out_c_batch.detach().numpy()
+            fluxStatuTest[i, :] = out_m_batch.detach().cpu().numpy()
+            balanceStatus[i, :] = out_c_batch.detach().cpu().numpy()
             
                    
     
@@ -355,6 +390,10 @@ def parse_arguments(parser):
                         help='User defined predicted balance file name.')
     parser.add_argument('--train_epoch', type=int, default=100, nargs='?',
                         help='User defined EPOCH (training iteration).')
+    parser.add_argument('--normalization', type=eval, default=False, choices=[True, False],
+                        help='Whether perform normalization for SC dataset.')                    
+    parser.add_argument('--device', default='auto', choices=['auto', 'gpu', 'cpu'],
+                        help='Perform training on which device')
     
     
 
